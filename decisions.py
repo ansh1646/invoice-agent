@@ -60,6 +60,7 @@ Rules:
 - Respond with JSON only. No markdown, no commentary."""
 
 _client = None
+GEMINI_TIMEOUT_MS = 18000
 
 
 def call_llm(system: str, user: str) -> str:
@@ -73,7 +74,8 @@ def call_llm(system: str, user: str) -> str:
 
         _client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=30000)
+            # Two attempts must complete within the 45-second A2A request budget.
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS)
         )
 
     response = _client.models.generate_content(

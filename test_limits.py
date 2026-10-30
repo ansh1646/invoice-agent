@@ -1,5 +1,6 @@
 import asyncio
 
+import decisions
 import main
 
 
@@ -13,6 +14,7 @@ def test_oversized_a2a_response_is_rejected():
 def test_request_timeout_is_explicit():
     assert main.REQUEST_TIMEOUT_SECONDS == 45
     assert main.OVERALL_EXECUTION_SECONDS == 160
+    assert decisions.GEMINI_TIMEOUT_MS == 18000
 
 
 def test_timeout_error_is_translated_to_api_error(monkeypatch):
