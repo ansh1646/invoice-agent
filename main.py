@@ -1,7 +1,9 @@
 import asyncio
+from contextvars import ContextVar
 import json
 import logging
 import os
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -117,16 +119,69 @@ app = FastAPI(
     openapi_url=None,
 )
 logger = logging.getLogger(__name__)
+request_id_var = ContextVar("request_id", default="-")
+
+
+def log_event(level: int, event: str, **fields) -> None:
+    """Emit one machine-readable log record without invoice contents or secrets."""
+    record = {"event": event, "request_id": request_id_var.get(), **fields}
+    logger.log(level, json.dumps(record, sort_keys=True, default=str))
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    request.state.request_id = request_id
+    token = request_id_var.set(request_id)
+    started = time.monotonic()
+    log_event(logging.INFO, "request_started", method=request.method)
+    try:
+        response = await call_next(request)
+        route = getattr(request.scope.get("route"), "path", "unmatched")
+        log_event(
+            logging.INFO if response.status_code < 400 else logging.WARNING,
+            "request_finished",
+            method=request.method,
+            route=route,
+            status=response.status_code,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            "request_unhandled_exception",
+            method=request.method,
+            error_type=type(exc).__name__,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise
+    finally:
+        request_id_var.reset(token)
 
 
 @app.exception_handler(ApiError)
-async def api_error(_request, exc: ApiError):
+async def api_error(request, exc: ApiError):
     # Do not reveal task IDs or whether another user's task exists.
+    log_event(
+        logging.WARNING,
+        "api_error",
+        method=request.method,
+        status=exc.status,
+        code=exc.code,
+    )
     return a2a({"error": {"code": exc.code}}, exc.status)
 
 
 @app.exception_handler(psycopg.Error)
 async def database_error(_request, _exc):
+    log_event(
+        logging.ERROR,
+        "database_error",
+        error_type=type(_exc).__name__,
+        sqlstate=getattr(_exc, "sqlstate", None),
+    )
     return a2a({"error": {"code": "DATABASE_UNAVAILABLE"}}, 503)
 
 
@@ -140,6 +195,7 @@ def authenticate(request: Request) -> str:
     token = token.strip()
 
     if scheme != "Bearer" or not token:
+        log_event(logging.WARNING, "authentication_failed", reason="missing_or_invalid_bearer")
         raise ApiError(401, "UNAUTHENTICATED")
 
     # Never store raw bearer tokens.
@@ -148,6 +204,7 @@ def authenticate(request: Request) -> str:
 
 def require_protocol(request: Request) -> None:
     if request.headers.get("A2A-Version") != "1.0":
+        log_event(logging.WARNING, "protocol_version_rejected")
         raise ApiError(400, "VERSION_NOT_SUPPORTED")
 
 
@@ -155,6 +212,7 @@ def require_json(request: Request) -> None:
     if not request.headers.get(
         "content-type", ""
     ).lower().startswith(A2A_MT):
+        log_event(logging.WARNING, "media_type_rejected")
         raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE")
 
 
@@ -162,14 +220,17 @@ async def read_body(request: Request) -> dict:
     raw = await request.body()
 
     if len(raw) > MAX_BODY:
+        log_event(logging.WARNING, "request_body_rejected", reason="too_large", bytes=len(raw))
         raise ApiError(413, "PAYLOAD_TOO_LARGE")
 
     try:
         body = json.loads(raw)
     except ValueError:
+        log_event(logging.WARNING, "request_body_rejected", reason="invalid_json")
         raise ApiError(400, "INVALID_JSON")
 
     if not isinstance(body, dict):
+        log_event(logging.WARNING, "request_body_rejected", reason="invalid_envelope")
         raise ApiError(400, "INVALID_ENVELOPE")
 
     return body
@@ -235,7 +296,9 @@ def read_task(principal: str, task_id: str) -> dict:
     if row is None:
         raise ApiError(404, "TASK_NOT_FOUND")
 
-    return task_from_row(row)
+    task = task_from_row(row)
+    log_event(logging.INFO, "task_read", task_id=task_id, state=task["status"]["state"])
+    return task
 
 
 # ---------- message:send ----------
@@ -247,11 +310,19 @@ def handle_send(principal: str, body: dict) -> dict:
         not isinstance(msg, dict)
         or not isinstance(msg.get("messageId"), str)
         or not isinstance(msg.get("parts"), list)
+        or msg.get("role") != "ROLE_USER"
     ):
         raise ApiError(400, "INVALID_ENVELOPE")
 
     # Hash the message only. Configuration is intentionally excluded.
     semantic = sha256_hex(canonical(msg))
+    message_fingerprint = sha256_hex(msg["messageId"])[:12]
+    log_event(
+        logging.INFO,
+        "message_received",
+        message_fingerprint=message_fingerprint,
+        has_task_id=bool(msg.get("taskId")),
+    )
 
     with store.key_lock((principal, msg["messageId"])):
         with store.distributed_key_lock((principal, msg["messageId"])):
@@ -267,8 +338,10 @@ def handle_send(principal: str, body: dict) -> dict:
 
             if seen:
                 if seen["semantic_hash"] != semantic:
+                    log_event(logging.WARNING, "idempotency_conflict", message_fingerprint=message_fingerprint)
                     raise ApiError(409, "IDEMPOTENCY_CONFLICT")
 
+                log_event(logging.INFO, "idempotency_replay", task_id=seen["task_id"])
                 return read_task(principal, seen["task_id"])
 
             if msg.get("taskId"):
@@ -296,6 +369,7 @@ def start_batch(
         or not packages
         or not all(isinstance(p, dict) for p in packages)
     ):
+        log_event(logging.WARNING, "batch_rejected", reason="invalid_batch_shape")
         raise ApiError(400, "INVALID_BATCH")
 
     ids = [p.get("packageId") for p in packages]
@@ -304,13 +378,30 @@ def start_batch(
         not all(isinstance(i, str) and i for i in ids)
         or len(set(ids)) != len(ids)
     ):
+        log_event(logging.WARNING, "batch_rejected", reason="invalid_or_duplicate_package_ids", package_count=len(packages))
         raise ApiError(400, "INVALID_BATCH")
 
+    log_event(logging.INFO, "batch_validated", batch_id=batch_id, package_count=len(packages))
+    decision_started = time.monotonic()
     try:
         decisions = decide_batch(packages, policy, store)
     except DecisionError as exc:
-        logger.error("Invoice decision unavailable: %s", exc)
+        log_event(
+            logging.ERROR,
+            "invoice_decision_unavailable",
+            batch_id=batch_id,
+            package_count=len(packages),
+            duration_ms=round((time.monotonic() - decision_started) * 1000),
+            reason=str(exc)[:1200],
+        )
         raise ApiError(503, "DECISION_UNAVAILABLE")
+    log_event(
+        logging.INFO,
+        "batch_decisions_ready",
+        batch_id=batch_id,
+        decision_count=len(decisions),
+        duration_ms=round((time.monotonic() - decision_started) * 1000),
+    )
 
     task_id = str(uuid.uuid4())
     context_id = msg.get("contextId") or str(uuid.uuid4())
@@ -336,6 +427,7 @@ def start_batch(
         },
     )
 
+    log_event(logging.INFO, "task_persistence_started", task_id=task_id, batch_id=batch_id)
     with store.transaction() as c:
 
         c.execute(
@@ -383,6 +475,7 @@ def start_batch(
             ),
         )
 
+    log_event(logging.INFO, "task_persisted", task_id=task_id, state=INPUT_REQUIRED, proposal_count=len(proposals))
     return read_task(principal, task_id)
 
 
@@ -436,6 +529,9 @@ def validate_results(
         elif outcome != "REJECTED":
             raise ApiError(400, "INVALID_OUTCOME")
 
+    if seen != set(proposals):
+        raise ApiError(400, "INCOMPLETE_RESULTS")
+
     return accepted
 
 
@@ -462,6 +558,13 @@ def record_execution(
             utcnow(),
         ),
     )
+    log_event(
+        logging.INFO,
+        "accepted_action_recorded",
+        task_id=task_id,
+        action_id=receipt["actionId"],
+        action=receipt["action"],
+    )
 
 
 def continue_task(
@@ -471,16 +574,14 @@ def continue_task(
 ) -> dict:
 
     task_id = msg["taskId"]
+    log_event(logging.INFO, "continuation_received", task_id=task_id)
     data = envelope_data(msg, RESULTS_MT)
 
     with store.transaction() as c:
 
         row = load_owned(c, principal, task_id)
 
-        if msg.get("contextId") not in (
-            None,
-            row["context_id"],
-        ):
+        if msg.get("contextId") != row["context_id"]:
             raise ApiError(400, "CONTEXT_MISMATCH")
 
         if row["state"] != INPUT_REQUIRED:
@@ -498,10 +599,21 @@ def continue_task(
             ).fetchall()
         }
 
+        if msg.get("role") != "ROLE_USER":
+            raise ApiError(400, "INVALID_ENVELOPE")
+
         accepted = validate_results(
             data,
             row["batch_id"],
             proposals,
+        )
+        log_event(
+            logging.INFO,
+            "continuation_validated",
+            task_id=task_id,
+            result_count=len(proposals),
+            accepted_count=len(accepted),
+            rejected_count=len(proposals) - len(accepted),
         )
 
         receipts = []
@@ -559,6 +671,7 @@ def continue_task(
         )
 
         if cur.rowcount != 1:
+            log_event(logging.WARNING, "task_completion_race_lost", task_id=task_id)
             raise ApiError(409, "TASK_NOT_CONTINUABLE")
 
         c.execute(
@@ -574,6 +687,7 @@ def continue_task(
             ),
         )
 
+    log_event(logging.INFO, "task_completed", task_id=task_id, receipt_count=len(receipts))
     return read_task(principal, task_id)
 
 
@@ -584,6 +698,7 @@ def run_cancel(
     task_id: str,
 ) -> dict:
 
+    log_event(logging.INFO, "task_cancel_requested", task_id=task_id)
     with store.transaction() as c:
 
         load_owned(c, principal, task_id)
@@ -603,8 +718,10 @@ def run_cancel(
         )
 
         if cur.rowcount != 1:
+            log_event(logging.WARNING, "task_cancel_rejected", task_id=task_id, reason="terminal_or_not_cancelable")
             raise ApiError(409, "TASK_NOT_CANCELABLE")
 
+    log_event(logging.INFO, "task_canceled", task_id=task_id)
     return read_task(principal, task_id)
 
 
@@ -666,6 +783,8 @@ def task_list(request: Request):
         """,
         (principal,),
     )
+
+    log_event(logging.INFO, "task_list_read", task_count=len(rows))
 
     return a2a({
         "tasks": [

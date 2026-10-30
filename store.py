@@ -1,6 +1,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from contextlib import contextmanager
@@ -8,6 +9,8 @@ from datetime import datetime, timezone
 
 import psycopg
 from psycopg.rows import dict_row
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -90,12 +93,21 @@ class Store:
         if not self.database_url:
             raise RuntimeError("DATABASE_URL environment variable is missing")
 
-        self._conn = psycopg.connect(
-            self.database_url,
-            autocommit=True,
-            row_factory=dict_row,
-            connect_timeout=10
-        )
+        logger.info("database_connection_started driver=postgresql")
+        try:
+            self._conn = psycopg.connect(
+                self.database_url,
+                autocommit=True,
+                row_factory=dict_row,
+                connect_timeout=10
+            )
+        except psycopg.Error as exc:
+            logger.error(
+                "database_connection_failed error_type=%s sqlstate=%s",
+                type(exc).__name__,
+                getattr(exc, "sqlstate", None),
+            )
+            raise
 
         self._conn.execute("SET TIME ZONE 'UTC'")
 
@@ -105,6 +117,7 @@ class Store:
 
         with self._conn.cursor() as cur:
             cur.execute(SCHEMA)
+        logger.info("database_schema_ready")
 
     def close(self):
         with self._lock:
