@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -61,6 +62,7 @@ Rules:
 
 _client = None
 GEMINI_TIMEOUT_MS = 18000
+logger = logging.getLogger(__name__)
 
 
 def call_llm(system: str, user: str) -> str:
@@ -202,6 +204,13 @@ def decide_batch(packages: list, policy: str, cache) -> list:
             by_id = {d.get("packageId"): d for d in raw.get("decisions", []) if isinstance(d, dict)}
         except Exception as exc:
             failures.append(f"model call failed on attempt {_attempt + 1}: {exc}")
+            logger.warning(
+                "Gemini decision attempt failed: model=%s attempt=%d packages=%d error_type=%s",
+                MODEL,
+                _attempt + 1,
+                len(todo),
+                type(exc).__name__,
+            )
             by_id = {}
         for key, pkg in todo:
             d = by_id.get(pkg["packageId"])
@@ -215,6 +224,12 @@ def decide_batch(packages: list, policy: str, cache) -> list:
             else:
                 failures.append(
                     f"{pkg['packageId']} validation failed: {', '.join(validation_errors)}"
+                )
+                logger.warning(
+                    "Gemini decision validation failed: model=%s package=%s errors=%s",
+                    MODEL,
+                    pkg["packageId"],
+                    ",".join(validation_errors),
                 )
 
     if len(decided) != len(packages):

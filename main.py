@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
 from urllib.parse import urlparse
@@ -115,6 +116,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+logger = logging.getLogger(__name__)
 
 
 @app.exception_handler(ApiError)
@@ -306,7 +308,8 @@ def start_batch(
 
     try:
         decisions = decide_batch(packages, policy, store)
-    except DecisionError:
+    except DecisionError as exc:
+        logger.error("Invoice decision unavailable: %s", exc)
         raise ApiError(503, "DECISION_UNAVAILABLE")
 
     task_id = str(uuid.uuid4())
