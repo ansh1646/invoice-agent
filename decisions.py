@@ -60,7 +60,7 @@ Rules:
 - Respond with JSON only. No markdown, no commentary."""
 
 _client = None
-GEMINI_TIMEOUT_MS = 35000
+GEMINI_TIMEOUT_MS = 18000
 
 
 def call_llm(system: str, user: str) -> str:
@@ -84,7 +84,7 @@ def call_llm(system: str, user: str) -> str:
         config=types.GenerateContentConfig(
             system_instruction=system,
             response_mime_type="application/json",
-            max_output_tokens=2000,
+            max_output_tokens=6000,
             temperature=0.1
         )
     )
@@ -203,8 +203,6 @@ def decide_batch(packages: list, policy: str, cache) -> list:
         except Exception as exc:
             failures.append(f"model call failed on attempt {_attempt + 1}: {exc}")
             by_id = {}
-            if _attempt == 0:
-                break
         for key, pkg in todo:
             d = by_id.get(pkg["packageId"])
             if d is None:
