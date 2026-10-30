@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import uuid
@@ -6,6 +7,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+import psycopg
 
 from decisions import DecisionError, decide_batch
 from store import Store, canonical, sha256_hex, task_from_row, utcnow
@@ -39,10 +41,16 @@ if (
 
 PREFIX = parsed.path.rstrip("/")
 
-# PostgreSQL connection through Neon.
-store = Store(os.environ.get("DATABASE_URL"))
+# Use the explicit local/test path when provided; Neon is the fallback.
+if os.environ.get("TESTING") == "1":
+    store = Store(os.environ["TEST_DATABASE_URL"])
+else:
+    store = Store(os.environ["DATABASE_URL"])
 
 MAX_BODY = 4 * 1024 * 1024
+MAX_RESPONSE = 512 * 1024
+REQUEST_TIMEOUT_SECONDS = 45
+OVERALL_EXECUTION_SECONDS = 160
 
 
 CARD = {
@@ -92,9 +100,12 @@ class ApiError(Exception):
 
 
 def a2a(payload, status: int = 200) -> JSONResponse:
+    response = JSONResponse(payload, status_code=status, media_type=A2A_MT)
+    if len(response.body) <= MAX_RESPONSE:
+        return response
     return JSONResponse(
-        payload,
-        status_code=status,
+        {"error": {"code": "RESPONSE_TOO_LARGE"}},
+        status_code=413,
         media_type=A2A_MT,
     )
 
@@ -110,6 +121,11 @@ app = FastAPI(
 async def api_error(_request, exc: ApiError):
     # Do not reveal task IDs or whether another user's task exists.
     return a2a({"error": {"code": exc.code}}, exc.status)
+
+
+@app.exception_handler(psycopg.Error)
+async def database_error(_request, _exc):
+    return a2a({"error": {"code": "DATABASE_UNAVAILABLE"}}, 503)
 
 
 # ---------- request guards ----------
@@ -236,26 +252,27 @@ def handle_send(principal: str, body: dict) -> dict:
     semantic = sha256_hex(canonical(msg))
 
     with store.key_lock((principal, msg["messageId"])):
+        with store.distributed_key_lock((principal, msg["messageId"])):
 
-        seen = store.one(
-            """
-            SELECT semantic_hash, task_id
-            FROM idempotency
-            WHERE principal=? AND message_id=?
-            """,
-            (principal, msg["messageId"]),
-        )
+            seen = store.one(
+                """
+                SELECT semantic_hash, task_id
+                FROM idempotency
+                WHERE principal=? AND message_id=?
+                """,
+                (principal, msg["messageId"]),
+            )
 
-        if seen:
-            if seen["semantic_hash"] != semantic:
-                raise ApiError(409, "IDEMPOTENCY_CONFLICT")
+            if seen:
+                if seen["semantic_hash"] != semantic:
+                    raise ApiError(409, "IDEMPOTENCY_CONFLICT")
 
-            return read_task(principal, seen["task_id"])
+                return read_task(principal, seen["task_id"])
 
-        if msg.get("taskId"):
-            return continue_task(principal, msg, semantic)
+            if msg.get("taskId"):
+                return continue_task(principal, msg, semantic)
 
-        return start_batch(principal, msg, semantic)
+            return start_batch(principal, msg, semantic)
 
 
 def start_batch(
@@ -607,11 +624,13 @@ async def message_send(request: Request):
 
     body = await read_body(request)
 
-    task = await run_in_threadpool(
-        handle_send,
-        principal,
-        body,
-    )
+    try:
+        task = await asyncio.wait_for(
+            run_in_threadpool(handle_send, principal, body),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise ApiError(504, "REQUEST_TIMEOUT")
 
     return a2a({"task": task})
 

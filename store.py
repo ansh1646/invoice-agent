@@ -123,6 +123,22 @@ class Store:
             return self._key_locks.setdefault(key, threading.Lock())
 
     @contextmanager
+    def distributed_key_lock(self, key):
+        """Serialize an idempotency key across application processes."""
+        lock_id = int.from_bytes(
+            hashlib.sha256(repr(key).encode("utf-8")).digest()[:8],
+            byteorder="big",
+            signed=True,
+        )
+        with self._lock:
+            self._conn.execute("SELECT pg_advisory_lock(%s)", (lock_id,))
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._conn.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+
+    @contextmanager
     def transaction(self):
         with self._lock:
             with self._conn.transaction():

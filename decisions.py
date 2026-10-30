@@ -2,7 +2,6 @@ import json
 import os
 from pathlib import Path
 import re
-from anthropic import Anthropic
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -74,7 +73,7 @@ def call_llm(system: str, user: str) -> str:
 
         _client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=120000)
+            http_options=types.HttpOptions(timeout=30000)
         )
 
     response = _client.models.generate_content(

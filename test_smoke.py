@@ -1,9 +1,12 @@
 import json
 import os
 import pathlib
+import uuid
+
+RUN_ID = uuid.uuid4().hex
 
 os.environ["PUBLIC_BASE_URL"] = "https://test.example.com/a2a"
-os.environ["DB_PATH"] = "test_agent.db"
+os.environ["TESTING"] = "1"
 pathlib.Path("test_agent.db").unlink(missing_ok=True)
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -62,21 +65,26 @@ def test_card_and_auth():
 
 
 def test_full_lifecycle_idempotency_and_isolation():
-    r = client.post(f"{P}/message:send", json=batch("m1"), headers=H)
+    mid = f"m1-{RUN_ID}"
+    r = client.post(f"{P}/message:send", json=batch(mid), headers=H)
     task = r.json()["task"]
     assert task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
     prop = task["artifacts"][0]["parts"][0]["data"]["proposals"][0]
 
     # Replay with reordered config must return the same task, not a new one.
-    again = client.post(f"{P}/message:send", json=batch("m1", {"returnImmediately": True}), headers=H)
+    again = client.post(
+        f"{P}/message:send",
+        json=batch(mid, {"returnImmediately": True}),
+        headers=H
+    )
     assert again.json()["task"]["id"] == task["id"]
 
     # Same messageId, different content -> conflict.
-    changed = batch("m1")
+    changed = batch(mid)
     changed["message"]["parts"][0]["data"]["batchId"] = "b2"
     assert client.post(f"{P}/message:send", json=changed, headers=H).status_code == 409
 
-    cont = {"message": {"messageId": "m2", "taskId": task["id"], "contextId": task["contextId"],
+    cont = {"message": {"messageId": f"m2-{RUN_ID}", "taskId": task["id"], "contextId": task["contextId"],
                         "role": "ROLE_USER", "parts": [{"mediaType": RESULTS_MT, "data": {
                             "batchId": "b1", "results": [{
                                 "packageId": prop["packageId"], "actionId": prop["actionId"],
